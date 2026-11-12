@@ -2,3 +2,22 @@
 
 ## Claude Computing
 
+### SudoSolver repository structure
+
+```text
+.
+├── frontend/              # React + TypeScript + Monaco
+├── backend/               # Python API + authentication + data
+├── services/              # Independent workers
+│   ├── generator/         # LLM providers + validation
+│   └── runner/            # Dockerized pytest execution
+├── infra/                 # Terraform AWS resources
+├── examples/              # Prebuilt interview problems
+├── docs/                  # Architecture + API contracts
+├── .github/
+│   └── workflows/         # CI/CD automation
+└── Makefile               # Common development commands
+```
+
+Directories currently contain `.gitkeep` placeholders so Git preserves the
+scaffold. Run `make help` to see the available development commands.
