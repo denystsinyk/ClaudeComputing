@@ -23,3 +23,6 @@ Most component directories currently contain `.gitkeep` placeholders. The first
 prebuilt exercise is in [`examples/task-store/`](examples/task-store/), with its
 package layout described in [`docs/problem-package.md`](docs/problem-package.md).
 Run `make help` to see the available development commands.
+
+The [runner guide](services/runner/README.md) shows how to build and execute the
+task-store exercise locally in Docker using the same job format planned for AWS.
