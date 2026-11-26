@@ -25,6 +25,7 @@ class ProblemPackage:
     instructions: str
     starter_files: dict[str, str]
     visible_tests: dict[str, bytes]
+    hidden_tests: dict[str, bytes]
 
     def catalog_entry(self) -> dict:
         return {
@@ -124,6 +125,7 @@ def load_problem(examples_root: Path, problem_id: str) -> ProblemPackage:
     hidden_paths = _paths(manifest, "hidden_tests")
     starter_files: dict[str, str] = {}
     visible_tests: dict[str, bytes] = {}
+    hidden_tests: dict[str, bytes] = {}
     for raw in starter_paths:
         path = _file_path(root, raw, "starter", ".py")
         workspace_name = raw.removeprefix("starter/")
@@ -132,7 +134,8 @@ def load_problem(examples_root: Path, problem_id: str) -> ProblemPackage:
         path = _file_path(root, raw, "tests", ".py")
         visible_tests[raw] = _read_text(path, MAX_SOURCE_BYTES).encode("utf-8")
     for raw in hidden_paths:
-        _read_text(_file_path(root, raw, "tests", ".py"), MAX_SOURCE_BYTES)
+        path = _file_path(root, raw, "tests", ".py")
+        hidden_tests[raw] = _read_text(path, MAX_SOURCE_BYTES).encode("utf-8")
     if set(visible_paths) & set(hidden_paths):
         raise PackageError("visible and hidden tests overlap")
 
@@ -150,6 +153,7 @@ def load_problem(examples_root: Path, problem_id: str) -> ProblemPackage:
         instructions=instructions,
         starter_files=starter_files,
         visible_tests=visible_tests,
+        hidden_tests=hidden_tests,
     )
 
 

@@ -8,7 +8,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
 
-from backend.jobs import ActiveJobError, DockerRunError, JobStore, failed_result
+from backend.execution import JobLifecycle
+from backend.jobs import ActiveJobError, failed_result
+from backend.ports import DispatchError, Dispatcher, IdentityVerifier
 from backend.problem_packages import (
     MAX_SOURCE_BYTES,
     PROBLEM_ID,
@@ -58,16 +60,16 @@ class Api:
     def __init__(
         self,
         examples_root: Path,
-        auth: TokenAuth,
-        jobs: JobStore,
-        executor,
-        scheduler,
+        auth: IdentityVerifier,
+        lifecycle: JobLifecycle,
+        dispatcher: Dispatcher,
     ) -> None:
         self.examples_root = examples_root
         self.auth = auth
-        self.jobs = jobs
-        self.executor = executor
-        self.scheduler = scheduler
+        self.lifecycle = lifecycle
+        self.jobs = lifecycle.jobs
+        self.submissions = lifecycle.submissions
+        self.dispatcher = dispatcher
 
     def handle(
         self, method: str, path: str, authorization: str | None = None, body: bytes = b""
@@ -95,21 +97,49 @@ class Api:
         parts = path.strip("/").split("/")
         if method == "GET" and len(parts) == 2 and parts[0] == "problems":
             return Response(200, self._problem(parts[1]).public_detail())
-        if method == "POST" and len(parts) == 3 and parts[0] == "problems" and parts[2] == "run":
+        if (
+            method == "GET"
+            and len(parts) == 3
+            and parts[0] == "problems"
+            and parts[2] == "submissions"
+        ):
+            package = self._problem(parts[1])
+            try:
+                history = self.submissions.list_for_user(user_id, package.id)
+            except Exception as exc:
+                raise ApiError(500, "submission_store_error") from exc
+            return Response(200, {"submissions": history})
+        if (
+            method == "POST"
+            and len(parts) == 3
+            and parts[0] == "problems"
+            and parts[2] in {"run", "submit"}
+        ):
+            mode = parts[2]
             package = self._problem(parts[1])
             files = self._parse_files(body, package)
             job_id = uuid.uuid4().hex
-            archive = self._make_job_zip(job_id, files, package)
+            submission_id = uuid.uuid4().hex if mode == "submit" else None
+            archive = self._make_job_zip(job_id, files, package, mode)
             try:
-                self.jobs.create(job_id, user_id, package.id)
+                self.jobs.create(job_id, user_id, package.id, mode, submission_id)
             except ActiveJobError as exc:
                 raise ApiError(409, "active_job_exists") from exc
+            if submission_id is not None:
+                try:
+                    self.submissions.create(submission_id, job_id, user_id, package.id, files)
+                except Exception as exc:
+                    self.jobs.start(job_id)
+                    self.jobs.finish(job_id, failed_result(job_id, "submission_store_error", mode))
+                    raise ApiError(500, "submission_store_error") from exc
             try:
-                self.scheduler.submit(self._run_job, job_id, archive)
-            except RuntimeError:
-                self.jobs.start(job_id)
-                self.jobs.finish(job_id, failed_result(job_id, "dispatch_unavailable"))
-            return Response(202, {"jobId": job_id, "status": "QUEUED"})
+                self.dispatcher.dispatch(job_id, archive)
+            except DispatchError:
+                self.lifecycle.fail_dispatch(job_id)
+            response = {"jobId": job_id, "status": "QUEUED"}
+            if submission_id is not None:
+                response["submissionId"] = submission_id
+            return Response(202, response)
         if method == "GET" and len(parts) == 2 and parts[0] == "jobs":
             job = self.jobs.get(parts[1])
             if not job or job["userId"] != user_id:
@@ -117,8 +147,11 @@ class Api:
             payload = {
                 "jobId": job["jobId"],
                 "problemId": job["problemId"],
+                "mode": job["mode"],
                 "status": job["status"],
             }
+            if job["submissionId"] is not None:
+                payload["submissionId"] = job["submissionId"]
             if job["result"] is not None:
                 payload["result"] = job["result"]
             return Response(200, payload)
@@ -157,30 +190,16 @@ class Api:
         return files
 
     @staticmethod
-    def _make_job_zip(job_id: str, files: dict[str, str], package: ProblemPackage) -> bytes:
-        metadata = {"schema_version": 1, "job_id": job_id, "mode": "run", "timeout_seconds": 10}
+    def _make_job_zip(
+        job_id: str, files: dict[str, str], package: ProblemPackage, mode: str
+    ) -> bytes:
+        metadata = {"schema_version": 1, "job_id": job_id, "mode": mode, "timeout_seconds": 10}
         buffer = io.BytesIO()
         with ZipFile(buffer, "w", ZIP_DEFLATED) as archive:
             archive.writestr("job.json", json.dumps(metadata))
             for path, contents in sorted(files.items()):
                 archive.writestr(f"submission/{path}", contents)
-            for path, contents in sorted(package.visible_tests.items()):
+            tests = package.visible_tests if mode == "run" else package.hidden_tests
+            for path, contents in sorted(tests.items()):
                 archive.writestr(path, contents)
         return buffer.getvalue()
-
-    def _run_job(self, job_id: str, archive: bytes) -> None:
-        if not self.jobs.start(job_id):
-            return  # Duplicate dispatch or an already finished job.
-        try:
-            result = self.executor.run(job_id, archive)
-        except DockerRunError as exc:
-            result = failed_result(job_id, exc.code)
-        except Exception:
-            result = failed_result(job_id, "internal_error")
-        if (
-            not isinstance(result, dict)
-            or result.get("job_id") != job_id
-            or result.get("status") not in {"COMPLETED", "FAILED"}
-        ):
-            result = failed_result(job_id, "invalid_runner_result")
-        self.jobs.finish(job_id, result)

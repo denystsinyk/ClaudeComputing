@@ -10,9 +10,11 @@ from zipfile import ZipFile
 import pytest
 
 from backend.api import Api, TokenAuth
+from backend.execution import JobLifecycle, LocalDispatcher
 from backend.jobs import DockerRunError, JobStore, failed_result
 from backend.local_server import create_server
 from backend.problem_packages import PackageError, load_problem
+from backend.submissions import LocalSubmissionStore
 
 
 EXAMPLES = Path(__file__).resolve().parents[2] / "examples"
@@ -35,31 +37,37 @@ class FakeExecutor:
         self.calls = []
         self.failure = failure
 
-    def run(self, job_id: str, archive: bytes) -> dict:
-        self.calls.append((job_id, archive))
+    def run(self, job_id: str, archive: bytes, mode: str) -> dict:
+        self.calls.append((job_id, archive, mode))
         if self.failure:
             raise DockerRunError(self.failure)
         return {
             "schema_version": 1,
             "job_id": job_id,
-            "mode": "run",
+            "mode": mode,
             "status": "COMPLETED",
             "verdict": "PASS",
-            "summary": {"passed": 4, "failed": 0, "errors": 0, "skipped": 0, "duration_ms": 200},
-            "tests": [],
+            "summary": {
+                "passed": 4 if mode == "run" else 5,
+                "failed": 0,
+                "errors": 0,
+                "skipped": 0,
+                "duration_ms": 200,
+            },
+            "tests": [{"name": "hidden_cases.test_secret"}] if mode == "submit" else [],
         }
 
 
 @pytest.fixture
-def app():
+def app(tmp_path: Path):
     scheduler = ManualScheduler()
     executor = FakeExecutor()
+    lifecycle = JobLifecycle(JobStore(), LocalSubmissionStore(tmp_path / "submissions.sqlite3"))
     api = Api(
         EXAMPLES,
         TokenAuth({"alice-token": "alice", "bob-token": "bob"}),
-        JobStore(),
-        executor,
-        scheduler,
+        lifecycle,
+        LocalDispatcher(executor, scheduler, lifecycle),
     )
     return api, scheduler, executor
 
@@ -70,9 +78,12 @@ def starter_files(api: Api) -> dict[str, str]:
     return detail.payload["files"]
 
 
-def run_request(api: Api, files: dict[str, str], token: str = "alice-token"):
+def run_request(api: Api, files: dict[str, str], token: str = "alice-token", mode: str = "run"):
     return api.handle(
-        "POST", "/problems/task-store/run", f"Bearer {token}", json.dumps({"files": files}).encode()
+        "POST",
+        f"/problems/task-store/{mode}",
+        f"Bearer {token}",
+        json.dumps({"files": files}).encode(),
     )
 
 
@@ -154,6 +165,127 @@ def test_runner_failure_becomes_failed_job(app) -> None:
     assert polled.payload["result"]["error"] == {"code": "docker_unavailable"}
 
 
+def test_submit_saves_private_snapshot_and_returns_only_summary(app) -> None:
+    api, scheduler, executor = app
+    files = starter_files(api)
+    original = files["task_store.py"]
+    accepted = run_request(api, files, mode="submit")
+    assert accepted.status == 202
+    submission_id = accepted.payload["submissionId"]
+    job_id = accepted.payload["jobId"]
+    files["task_store.py"] = "changed after submission"
+    assert api.submissions.snapshot(submission_id)["task_store.py"] == original
+
+    queued = api.handle("GET", "/problems/task-store/submissions", "Bearer alice-token")
+    assert queued.payload["submissions"][0]["status"] == "QUEUED"
+    assert api.handle("GET", "/problems/task-store/submissions", "Bearer bob-token").payload == {
+        "submissions": []
+    }
+
+    scheduler.run_next()
+    job = api.handle("GET", f"/jobs/{job_id}", "Bearer alice-token")
+    assert job.payload["status"] == "COMPLETED"
+    assert job.payload["mode"] == "submit"
+    assert job.payload["submissionId"] == submission_id
+    assert job.payload["result"]["summary"]["passed"] == 5
+    assert "tests" not in job.payload["result"]
+    assert "hidden_cases" not in json.dumps(job.payload)
+
+    history = api.handle("GET", "/problems/task-store/submissions", "Bearer alice-token")
+    assert history.payload["submissions"][0]["verdict"] == "PASS"
+    assert history.payload["submissions"][0]["summary"]["passed"] == 5
+    assert "files" not in json.dumps(history.payload)
+    assert "hidden_cases" not in json.dumps(history.payload)
+
+    with ZipFile(io.BytesIO(executor.calls[0][1])) as archive:
+        names = set(archive.namelist())
+        metadata = json.loads(archive.read("job.json"))
+    assert names == {
+        "job.json",
+        "submission/task.py",
+        "submission/task_store.py",
+        "tests/hidden_cases.py",
+    }
+    assert metadata["mode"] == "submit"
+
+
+def test_failed_submission_history_and_duplicate_completion(app) -> None:
+    api, scheduler, executor = app
+    executor.failure = "docker_failed"
+    accepted = run_request(api, starter_files(api), mode="submit")
+    function, args = scheduler.tasks[0]
+    function(*args)
+    function(*args)
+    assert len(executor.calls) == 1
+
+    job_id = accepted.payload["jobId"]
+    job = api.handle("GET", f"/jobs/{job_id}", "Bearer alice-token")
+    assert job.payload["status"] == "FAILED"
+    assert job.payload["result"]["mode"] == "submit"
+    history = api.handle("GET", "/problems/task-store/submissions", "Bearer alice-token")
+    assert history.payload["submissions"][0]["error"] == {"code": "docker_failed"}
+
+
+def test_shared_lifecycle_accepts_external_completion_once(app) -> None:
+    api, scheduler, _ = app
+    accepted = run_request(api, starter_files(api), mode="submit")
+    job_id = accepted.payload["jobId"]
+    result = {
+        "schema_version": 1,
+        "job_id": job_id,
+        "mode": "submit",
+        "status": "COMPLETED",
+        "verdict": "FAIL",
+        "summary": {"passed": 3, "failed": 2, "errors": 0, "skipped": 0, "duration_ms": 50},
+        "tests": [{"name": "hidden_cases.test_private"}],
+    }
+
+    assert api.lifecycle.start(job_id) is True
+    assert api.lifecycle.finish(job_id, result) is True
+    assert api.lifecycle.finish(job_id, result) is False
+    scheduler.run_next()  # A delayed duplicate dispatch must not run after completion.
+
+    job = api.handle("GET", f"/jobs/{job_id}", "Bearer alice-token")
+    assert job.payload["result"]["verdict"] == "FAIL"
+    assert "tests" not in job.payload["result"]
+    assert api.handle("GET", "/problems/task-store/submissions", "Bearer alice-token").payload[
+        "submissions"
+    ][0]["verdict"] == "FAIL"
+
+
+def test_dispatch_failure_marks_submission_failed(app) -> None:
+    api, _, _ = app
+
+    class RejectedScheduler:
+        def submit(self, function, *args) -> None:
+            raise RuntimeError("shut down")
+
+    api.dispatcher = LocalDispatcher(FakeExecutor(), RejectedScheduler(), api.lifecycle)
+    accepted = run_request(api, starter_files(api), mode="submit")
+
+    assert accepted.status == 202
+    job = api.handle("GET", f"/jobs/{accepted.payload['jobId']}", "Bearer alice-token")
+    assert job.payload["status"] == "FAILED"
+    assert job.payload["result"]["error"] == {"code": "dispatch_unavailable"}
+    history = api.handle("GET", "/problems/task-store/submissions", "Bearer alice-token")
+    assert history.payload["submissions"][0]["status"] == "FAILED"
+
+
+def test_submission_history_survives_local_store_restart(tmp_path: Path) -> None:
+    database = tmp_path / "private/submissions.sqlite3"
+    store = LocalSubmissionStore(database)
+    store.create("submission-1", "job-1", "alice", "task-store", {"task.py": "private code"})
+    store.start("job-1")
+
+    restarted = LocalSubmissionStore(database)
+
+    assert restarted.snapshot("submission-1") == {"task.py": "private code"}
+    assert restarted.list_for_user("alice", "task-store")[0]["error"] == {
+        "code": "local_restart"
+    }
+    assert restarted.list_for_user("bob", "task-store") == []
+
+
 def test_job_store_rejects_duplicate_ids_and_invalid_transitions() -> None:
     jobs = JobStore()
     jobs.create("job-1", "alice", "task-store")
@@ -180,8 +312,9 @@ def test_job_store_rejects_duplicate_ids_and_invalid_transitions() -> None:
 )
 def test_bad_run_requests_are_rejected(app, body: bytes) -> None:
     api, _, _ = app
-    response = api.handle("POST", "/problems/task-store/run", "Bearer alice-token", body)
-    assert response.status == 400
+    for mode in ("run", "submit"):
+        response = api.handle("POST", f"/problems/task-store/{mode}", "Bearer alice-token", body)
+        assert response.status == 400
 
 
 def test_invalid_package_path_is_rejected(tmp_path: Path) -> None:
@@ -227,6 +360,28 @@ def test_loopback_http_adapter(app) -> None:
         request = Request(f"{base}/jobs/{job_id}", headers={"Authorization": "Bearer alice-token"})
         with urlopen(request) as response:
             assert json.load(response)["status"] == "COMPLETED"
+
+        submit = Request(
+            f"{base}/problems/task-store/submit",
+            data=body,
+            headers={"Authorization": "Bearer alice-token", "Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(submit) as response:
+            submission_job_id = json.load(response)["jobId"]
+        scheduler.run_next()
+        request = Request(
+            f"{base}/jobs/{submission_job_id}",
+            headers={"Authorization": "Bearer alice-token"},
+        )
+        with urlopen(request) as response:
+            assert "tests" not in json.load(response)["result"]
+        request = Request(
+            f"{base}/problems/task-store/submissions",
+            headers={"Authorization": "Bearer alice-token"},
+        )
+        with urlopen(request) as response:
+            assert len(json.load(response)["submissions"]) == 1
     finally:
         server.shutdown()
         server.server_close()

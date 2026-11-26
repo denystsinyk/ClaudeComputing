@@ -18,7 +18,7 @@ The Docker command in the Makefile uses a read-only filesystem, no network, no L
 
 ## Job ZIP v1
 
-The API will eventually create the same ZIP and store it at `jobs/<jobId>/input.zip`. It contains:
+The local API creates this ZIP today. An AWS adapter can store it at `jobs/<jobId>/input.zip`. It contains:
 
 ```text
 job.json                 {"schema_version":1,"job_id":"...","mode":"run|submit","timeout_seconds":10}

@@ -29,7 +29,16 @@ class JobStore:
         self._jobs: dict[str, dict] = {}
         self._lock = threading.Lock()
 
-    def create(self, job_id: str, user_id: str, problem_id: str) -> None:
+    def create(
+        self,
+        job_id: str,
+        user_id: str,
+        problem_id: str,
+        mode: str = "run",
+        submission_id: str | None = None,
+    ) -> None:
+        if mode not in {"run", "submit"}:
+            raise ValueError("invalid job mode")
         with self._lock:
             if job_id in self._jobs:
                 raise ValueError("job already exists")
@@ -42,6 +51,8 @@ class JobStore:
                 "jobId": job_id,
                 "userId": user_id,
                 "problemId": problem_id,
+                "mode": mode,
+                "submissionId": submission_id,
                 "status": "QUEUED",
                 "result": None,
             }
@@ -71,11 +82,11 @@ class JobStore:
             return True
 
 
-def failed_result(job_id: str, code: str) -> dict:
+def failed_result(job_id: str, code: str, mode: str = "run") -> dict:
     return {
         "schema_version": 1,
         "job_id": job_id,
-        "mode": "run",
+        "mode": mode,
         "status": "FAILED",
         "verdict": None,
         "error": {"code": code},
@@ -88,7 +99,7 @@ class LocalDockerExecutor:
     def __init__(self, image: str = "sudosolver-runner:local") -> None:
         self.image = image
 
-    def run(self, job_id: str, archive: bytes) -> dict:
+    def run(self, job_id: str, archive: bytes, mode: str = "run") -> dict:
         with tempfile.TemporaryDirectory(prefix="sudosolver-job-") as directory:
             root = Path(directory)
             input_dir = root / "input"
@@ -131,7 +142,7 @@ class LocalDockerExecutor:
                 not isinstance(result, dict)
                 or result.get("schema_version") != 1
                 or result.get("job_id") != job_id
-                or result.get("mode") != "run"
+                or result.get("mode") != mode
                 or result.get("status") not in {"COMPLETED", "FAILED"}
             ):
                 raise DockerRunError("invalid_runner_result")

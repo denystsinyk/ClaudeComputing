@@ -9,7 +9,9 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from backend.api import MAX_REQUEST_BYTES, Api, Response, TokenAuth
+from backend.execution import JobLifecycle, LocalDispatcher
 from backend.jobs import JobStore, LocalDockerExecutor
+from backend.submissions import LocalSubmissionStore
 
 
 def create_server(api: Api, port: int = 8080) -> ThreadingHTTPServer:
@@ -52,9 +54,18 @@ def main() -> None:
     token = os.environ.get("SUDOSOLVER_LOCAL_TOKEN") or secrets.token_urlsafe(32)
     port = int(os.environ.get("SUDOSOLVER_PORT", "8080"))
     examples = Path(__file__).resolve().parents[1] / "examples"
+    database = Path(
+        os.environ.get(
+            "SUDOSOLVER_LOCAL_DB", str(Path(__file__).parent / ".local/submissions.sqlite3")
+        )
+    )
     with ThreadPoolExecutor(max_workers=2) as scheduler:
+        lifecycle = JobLifecycle(JobStore(), LocalSubmissionStore(database))
         api = Api(
-            examples, TokenAuth({token: "local-dev"}), JobStore(), LocalDockerExecutor(), scheduler
+            examples,
+            TokenAuth({token: "local-dev"}),
+            lifecycle,
+            LocalDispatcher(LocalDockerExecutor(), scheduler, lifecycle),
         )
         server = create_server(api, port)
         print(f"Local API: http://127.0.0.1:{server.server_port}", flush=True)
