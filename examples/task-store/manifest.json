@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "id": "task-store",
+  "title": "Build a Task Store",
+  "language": "python",
+  "difficulty": "easy",
+  "estimated_minutes": 25,
+  "instructions": "instructions.md",
+  "starter_files": [
+    "starter/task.py",
+    "starter/task_store.py"
+  ],
+  "visible_tests": [
+    "tests/visible_cases.py"
+  ],
+  "hidden_tests": [
+    "tests/hidden_cases.py"
+  ],
+  "reference_files": {
+    "starter/task_store.py": "reference/task_store.py"
+  }
+}
