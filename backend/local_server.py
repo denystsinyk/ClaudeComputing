@@ -12,6 +12,7 @@ from backend.api import MAX_REQUEST_BYTES, Api, Response, TokenAuth
 from backend.execution import JobLifecycle, LocalDispatcher
 from backend.jobs import JobStore, LocalDockerExecutor
 from backend.submissions import LocalSubmissionStore
+from backend.workspaces import LocalWorkspaceStore
 
 
 def create_server(api: Api, port: int = 8080) -> ThreadingHTTPServer:
@@ -29,7 +30,7 @@ def create_server(api: Api, port: int = 8080) -> ThreadingHTTPServer:
             path = urlsplit(self.path).path
             self._respond(api.handle("GET", path, self.headers.get("Authorization")))
 
-        def do_POST(self) -> None:
+        def _write_request(self, method: str) -> None:
             path = urlsplit(self.path).path
             authorization = self.headers.get("Authorization")
             if api.auth.user_id(authorization) is None:
@@ -45,7 +46,13 @@ def create_server(api: Api, port: int = 8080) -> ThreadingHTTPServer:
                 self._respond(Response(400, {"error": {"code": "request_too_large"}}))
                 return
             body = self.rfile.read(length)
-            self._respond(api.handle("POST", path, authorization, body))
+            self._respond(api.handle(method, path, authorization, body))
+
+        def do_POST(self) -> None:
+            self._write_request("POST")
+
+        def do_PUT(self) -> None:
+            self._write_request("PUT")
 
     return ThreadingHTTPServer(("127.0.0.1", port), Handler)
 
@@ -59,6 +66,12 @@ def main() -> None:
             "SUDOSOLVER_LOCAL_DB", str(Path(__file__).parent / ".local/submissions.sqlite3")
         )
     )
+    workspace_database = Path(
+        os.environ.get(
+            "SUDOSOLVER_LOCAL_WORKSPACES_DB",
+            str(Path(__file__).parent / ".local/workspaces.sqlite3"),
+        )
+    )
     with ThreadPoolExecutor(max_workers=2) as scheduler:
         lifecycle = JobLifecycle(JobStore(), LocalSubmissionStore(database))
         api = Api(
@@ -66,6 +79,7 @@ def main() -> None:
             TokenAuth({token: "local-dev"}),
             lifecycle,
             LocalDispatcher(LocalDockerExecutor(), scheduler, lifecycle),
+            LocalWorkspaceStore(workspace_database),
         )
         server = create_server(api, port)
         print(f"Local API: http://127.0.0.1:{server.server_port}", flush=True)

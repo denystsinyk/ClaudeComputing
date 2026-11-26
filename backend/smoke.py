@@ -8,6 +8,7 @@ from backend.api import Api, TokenAuth
 from backend.execution import JobLifecycle, LocalDispatcher
 from backend.jobs import JobStore, LocalDockerExecutor
 from backend.submissions import LocalSubmissionStore
+from backend.workspaces import LocalWorkspaceStore
 
 
 class ImmediateScheduler:
@@ -26,6 +27,7 @@ def main() -> None:
             TokenAuth({"smoke-token": "smoke-user"}),
             lifecycle,
             LocalDispatcher(LocalDockerExecutor(), ImmediateScheduler(), lifecycle),
+            LocalWorkspaceStore(Path(directory) / "workspaces.sqlite3"),
         )
         detail = api.handle("GET", "/problems/task-store", "Bearer smoke-token")
         if detail.status != 200:
@@ -33,6 +35,15 @@ def main() -> None:
 
         files = detail.payload["files"]
         files["task_store.py"] = (examples / "task-store/reference/task_store.py").read_text()
+        saved = api.handle(
+            "PUT",
+            "/problems/task-store/workspace",
+            "Bearer smoke-token",
+            json.dumps({"files": files, "revision": 0}).encode(),
+        )
+        loaded = api.handle("GET", "/problems/task-store/workspace", "Bearer smoke-token")
+        if saved.status != 200 or loaded.payload["files"] != files:
+            raise SystemExit("Workspace save/load smoke test failed")
         for mode in ("run", "submit"):
             accepted = api.handle(
                 "POST",

@@ -10,7 +10,7 @@ from zipfile import ZIP_DEFLATED, ZipFile
 
 from backend.execution import JobLifecycle
 from backend.jobs import ActiveJobError, failed_result
-from backend.ports import DispatchError, Dispatcher, IdentityVerifier
+from backend.ports import DispatchError, Dispatcher, IdentityVerifier, WorkspaceRepository
 from backend.problem_packages import (
     MAX_SOURCE_BYTES,
     PROBLEM_ID,
@@ -19,6 +19,7 @@ from backend.problem_packages import (
     list_problems,
     load_problem,
 )
+from backend.workspaces import MAX_REVISION, WorkspaceConflict
 
 
 MAX_REQUEST_BYTES = 256_000
@@ -63,6 +64,7 @@ class Api:
         auth: IdentityVerifier,
         lifecycle: JobLifecycle,
         dispatcher: Dispatcher,
+        workspaces: WorkspaceRepository,
     ) -> None:
         self.examples_root = examples_root
         self.auth = auth
@@ -70,6 +72,7 @@ class Api:
         self.jobs = lifecycle.jobs
         self.submissions = lifecycle.submissions
         self.dispatcher = dispatcher
+        self.workspaces = workspaces
 
     def handle(
         self, method: str, path: str, authorization: str | None = None, body: bytes = b""
@@ -109,6 +112,34 @@ class Api:
             except Exception as exc:
                 raise ApiError(500, "submission_store_error") from exc
             return Response(200, {"submissions": history})
+        if (
+            method in {"GET", "PUT"}
+            and len(parts) == 3
+            and parts[0] == "problems"
+            and parts[2] == "workspace"
+        ):
+            package = self._problem(parts[1])
+            if method == "GET":
+                try:
+                    workspace = self.workspaces.get(user_id, package.id)
+                except Exception as exc:
+                    raise ApiError(500, "workspace_store_error") from exc
+                if workspace is None:
+                    return Response(
+                        200,
+                        {"files": package.starter_files.copy(), "revision": 0, "updatedAt": None},
+                    )
+                if set(workspace.files) != set(package.starter_files):
+                    raise ApiError(500, "invalid_workspace")
+                return Response(200, workspace.response())
+            files, revision = self._parse_workspace(body, package)
+            try:
+                saved = self.workspaces.save(user_id, package.id, files, revision)
+            except WorkspaceConflict as exc:
+                raise ApiError(409, "workspace_conflict") from exc
+            except Exception as exc:
+                raise ApiError(500, "workspace_store_error") from exc
+            return Response(200, saved.response())
         if (
             method == "POST"
             and len(parts) == 3
@@ -166,16 +197,19 @@ class Api:
             raise ApiError(500, "invalid_problem_package") from exc
 
     @staticmethod
-    def _parse_files(body: bytes, package: ProblemPackage) -> dict[str, str]:
+    def _parse_json_body(body: bytes) -> dict:
         if len(body) > MAX_REQUEST_BYTES:
             raise ApiError(400, "request_too_large")
         try:
             request = json.loads(body)
         except (UnicodeError, json.JSONDecodeError) as exc:
             raise ApiError(400, "invalid_json") from exc
-        if not isinstance(request, dict) or set(request) != {"files"}:
+        if not isinstance(request, dict):
             raise ApiError(400, "invalid_files")
-        files = request["files"]
+        return request
+
+    @staticmethod
+    def _validate_files(files: object, package: ProblemPackage) -> dict[str, str]:
         if not isinstance(files, dict) or set(files) != set(package.starter_files):
             raise ApiError(400, "invalid_files")
         for contents in files.values():
@@ -188,6 +222,23 @@ class Api:
             if size > MAX_SOURCE_BYTES:
                 raise ApiError(400, "invalid_files")
         return files
+
+    @classmethod
+    def _parse_files(cls, body: bytes, package: ProblemPackage) -> dict[str, str]:
+        request = cls._parse_json_body(body)
+        if set(request) != {"files"}:
+            raise ApiError(400, "invalid_files")
+        return cls._validate_files(request["files"], package)
+
+    @classmethod
+    def _parse_workspace(cls, body: bytes, package: ProblemPackage) -> tuple[dict[str, str], int]:
+        request = cls._parse_json_body(body)
+        if set(request) != {"files", "revision"}:
+            raise ApiError(400, "invalid_workspace")
+        revision = request["revision"]
+        if type(revision) is not int or not 0 <= revision <= MAX_REVISION:
+            raise ApiError(400, "invalid_workspace")
+        return cls._validate_files(request["files"], package), revision
 
     @staticmethod
     def _make_job_zip(

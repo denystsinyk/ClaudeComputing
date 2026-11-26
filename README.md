@@ -26,4 +26,4 @@ Run `make help` to see the available development commands.
 
 The [runner guide](services/runner/README.md) shows how to build and execute the
 task-store exercise locally in Docker using the same job format planned for AWS.
-The [local API guide](backend/README.md) describes the prebuilt-problem run and submit flows.
+The [local API guide](backend/README.md) describes workspace save/load, run, and submit.

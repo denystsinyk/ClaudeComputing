@@ -2,6 +2,7 @@ import io
 import json
 import shutil
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -13,8 +14,9 @@ from backend.api import Api, TokenAuth
 from backend.execution import JobLifecycle, LocalDispatcher
 from backend.jobs import DockerRunError, JobStore, failed_result
 from backend.local_server import create_server
-from backend.problem_packages import PackageError, load_problem
+from backend.problem_packages import MAX_SOURCE_BYTES, PackageError, load_problem
 from backend.submissions import LocalSubmissionStore
+from backend.workspaces import LocalWorkspaceStore, WorkspaceConflict
 
 
 EXAMPLES = Path(__file__).resolve().parents[2] / "examples"
@@ -68,6 +70,7 @@ def app(tmp_path: Path):
         TokenAuth({"alice-token": "alice", "bob-token": "bob"}),
         lifecycle,
         LocalDispatcher(executor, scheduler, lifecycle),
+        LocalWorkspaceStore(tmp_path / "workspaces.sqlite3"),
     )
     return api, scheduler, executor
 
@@ -84,6 +87,17 @@ def run_request(api: Api, files: dict[str, str], token: str = "alice-token", mod
         f"/problems/task-store/{mode}",
         f"Bearer {token}",
         json.dumps({"files": files}).encode(),
+    )
+
+
+def save_workspace(
+    api: Api, files: dict[str, str], revision: int, token: str = "alice-token"
+):
+    return api.handle(
+        "PUT",
+        "/problems/task-store/workspace",
+        f"Bearer {token}",
+        json.dumps({"files": files, "revision": revision}).encode(),
     )
 
 
@@ -135,6 +149,97 @@ def test_identity_and_job_ownership(app) -> None:
     assert api.handle("GET", f"/jobs/{job_id}", "Bearer café").status == 401
     assert api.handle("GET", "/problems/task-store", "Bearer wrong-token").status == 401
     assert api.handle("GET", "/problems/unknown", "Bearer alice-token").status == 404
+
+
+def test_workspace_defaults_to_starter_and_persists_edits(app, tmp_path: Path) -> None:
+    api, _, _ = app
+    initial = api.handle("GET", "/problems/task-store/workspace", "Bearer alice-token")
+    assert initial.status == 200
+    assert initial.payload == {
+        "files": starter_files(api),
+        "revision": 0,
+        "updatedAt": None,
+    }
+
+    files = initial.payload["files"].copy()
+    files["task_store.py"] = "# My saved edit\n"
+    saved = save_workspace(api, files, revision=0)
+    assert saved.status == 200
+    assert saved.payload["revision"] == 1
+    assert saved.payload["updatedAt"] is not None
+    assert api.handle("GET", "/problems/task-store/workspace", "Bearer alice-token").payload == (
+        saved.payload
+    )
+
+    reopened = LocalWorkspaceStore(tmp_path / "workspaces.sqlite3")
+    assert reopened.get("alice", "task-store").files == files
+    assert reopened.get("alice", "task-store").revision == 1
+
+
+def test_workspace_is_user_scoped_and_rejects_stale_save(app) -> None:
+    api, _, _ = app
+    alice_files = starter_files(api)
+    alice_files["task_store.py"] = "# Alice's code\n"
+    assert save_workspace(api, alice_files, revision=0).status == 200
+
+    bob_initial = api.handle("GET", "/problems/task-store/workspace", "Bearer bob-token")
+    assert bob_initial.payload["revision"] == 0
+    assert bob_initial.payload["files"] != alice_files
+    bob_files = bob_initial.payload["files"].copy()
+    bob_files["task_store.py"] = "# Bob's code\n"
+    assert save_workspace(api, bob_files, revision=0, token="bob-token").status == 200
+
+    stale = save_workspace(api, bob_files, revision=0)
+    assert stale.status == 409
+    assert stale.payload == {"error": {"code": "workspace_conflict"}}
+    alice_loaded = api.handle("GET", "/problems/task-store/workspace", "Bearer alice-token")
+    assert alice_loaded.payload["files"] == alice_files
+    assert alice_loaded.payload["revision"] == 1
+    assert save_workspace(api, alice_files, revision=1).payload["revision"] == 2
+
+
+def test_workspace_rejects_bad_files_and_identity(app) -> None:
+    api, _, _ = app
+    files = starter_files(api)
+    bad_bodies = [
+        b"not json",
+        json.dumps({"files": files}).encode(),
+        json.dumps({"files": files, "revision": True}).encode(),
+        json.dumps({"files": files, "revision": -1}).encode(),
+        json.dumps({"files": {"task.py": "pass"}, "revision": 0}).encode(),
+        json.dumps({"files": {**files, "extra.py": "pass"}, "revision": 0}).encode(),
+        json.dumps(
+            {"files": {**files, "task.py": "x" * (MAX_SOURCE_BYTES + 1)}, "revision": 0}
+        ).encode(),
+        json.dumps({"files": files, "revision": 0, "userId": "bob"}).encode(),
+    ]
+    for body in bad_bodies:
+        response = api.handle("PUT", "/problems/task-store/workspace", "Bearer alice-token", body)
+        assert response.status == 400
+    denied = api.handle("PUT", "/problems/task-store/workspace", "Bearer wrong-token", b"")
+    assert denied.status == 401
+    assert api.handle("GET", "/problems/unknown/workspace", "Bearer alice-token").status == 404
+    assert api.handle("GET", "/problems/task-store/workspace", "Bearer alice-token").payload[
+        "revision"
+    ] == 0
+
+
+def test_concurrent_workspace_saves_allow_one_revision(tmp_path: Path) -> None:
+    store = LocalWorkspaceStore(tmp_path / "workspaces.sqlite3")
+    files = {"task.py": "pass"}
+
+    def save() -> str:
+        try:
+            store.save("alice", "task-store", files, expected_revision=0)
+            return "saved"
+        except WorkspaceConflict:
+            return "conflict"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(lambda _: save(), range(2)))
+    assert sorted(outcomes) == ["conflict", "saved"]
+    assert store.get("alice", "task-store").revision == 1
+    assert store.get("alice", "another-problem") is None
 
 
 def test_active_job_conflict_and_duplicate_dispatch(app) -> None:
@@ -346,7 +451,23 @@ def test_loopback_http_adapter(app) -> None:
             urlopen(f"{base}/problems")
         assert denied.value.code == 401
 
-        body = json.dumps({"files": starter_files(api)}).encode()
+        files = starter_files(api)
+        request = Request(
+            f"{base}/problems/task-store/workspace",
+            headers={"Authorization": "Bearer alice-token"},
+        )
+        with urlopen(request) as response:
+            assert json.load(response)["revision"] == 0
+        save = Request(
+            f"{base}/problems/task-store/workspace",
+            data=json.dumps({"files": files, "revision": 0}).encode(),
+            headers={"Authorization": "Bearer alice-token", "Content-Type": "application/json"},
+            method="PUT",
+        )
+        with urlopen(save) as response:
+            assert json.load(response)["revision"] == 1
+
+        body = json.dumps({"files": files}).encode()
         request = Request(
             f"{base}/problems/task-store/run",
             data=body,

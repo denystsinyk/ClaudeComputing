@@ -2,6 +2,8 @@
 
 from typing import Callable, Protocol
 
+from backend.workspaces import Workspace
+
 
 class DispatchError(Exception):
     """A job was not accepted by the local scheduler or a future queue."""
@@ -33,6 +35,14 @@ class SubmissionRepository(Protocol):
     def finish(self, job_id: str, result: dict) -> None: ...
 
     def list_for_user(self, user_id: str, problem_id: str) -> list[dict]: ...
+
+
+class WorkspaceRepository(Protocol):
+    def get(self, user_id: str, problem_id: str) -> Workspace | None: ...
+
+    def save(
+        self, user_id: str, problem_id: str, files: dict[str, str], expected_revision: int
+    ) -> Workspace: ...
 
 
 class Executor(Protocol):
